@@ -37,6 +37,7 @@ def vln_action_complexity(seq_str: str, alpha: float = 0.5, window_size=5) -> fl
         if toks[-1]!="stop" or toks.count("stop")!=1: raise ValueError
     else:
         if len(toks)!=window_size: raise ValueError
+    # 第一种复杂度指标，计算动作有多不可预测
     n,K=len(toks),4
     counts=defaultdict(lambda:{a:0 for a in actions})
     L,ctx=0.0,"<BOS>"
@@ -48,6 +49,7 @@ def vln_action_complexity(seq_str: str, alpha: float = 0.5, window_size=5) -> fl
         ctx=a
     s=max(0.0,min(1.0,L/(n*log2(K))))
     s*=n/(n+2)
+    # 第二种复杂度指标，计算动作切换是否发生的频繁
     idx=len(toks)-1 if toks[-1]=="stop" else len(toks)
     trans=max(0,idx-1)
     changes=sum(1 for i in range(1,idx) if toks[i]!=toks[i-1])
@@ -71,6 +73,7 @@ def build_user_prompt(user_instruction: str, history_count: int, stop_count: int
         "PS: The mission is complex. You may infer several sub-tasks within the mission, and output <|stop|> when a sub-task is achieved. "
         f"So far, you have output <|stop|> {stop_count} times. Historical information reflects progress up to the current subgoal. <|NAV|>"
     )
+    # 所以 <|stop|> 可能是一个subtask的结束
     return "\n".join(lines)
 
 
@@ -89,6 +92,27 @@ def str_to_action(input_str: str) -> str:
 
 
 def generate_swift_dataset(args):
+    """
+    历史观测最多 20 张图，由 max_his_image_num=20 控制；这些历史图在循环里实际上保存的是过去各时刻的 front view。再加上当前时刻固定的 left / front / right 3 张图，所以一条样本最多输入 23 张图片。代码会在超过时截成最近的 20 + 3 张。
+    未来动作默认预测 5 个，由 window_size=5 控制。正常情况攒够 5 个动作就生成一条数据；如果中途遇到 <|stop|>，则提前结束，所以实际 target action 数量是 1～5 个。
+    同时保存的 future_images 数量和未来动作数严格一致，因为代码有 assert act_num == len(future_images)；所以也是 最多 5 张未来 front 图。
+
+    k=0 时：
+    第一条：
+    history = []
+    current = L[-1], F[-1], R[-1]
+    target  = a[0:5]
+
+    第二条：
+    history = F[-1], F[0], F[1], F[2], F[3]
+    current = L[4], F[4], R[4]
+    target  = a[5:10]
+
+    第三条：
+    history = F[-1] ... F[8]
+    current = L[9], F[9], R[9]
+    target  = a[10:15]
+    """
     # Get parameters
     set_name = args.set_name
     base_dir = args.base_dir
@@ -135,10 +159,10 @@ def generate_swift_dataset(args):
                     task_instructions = sample_subset(task_instructions, sample_ratio, seed=42)
 
                 for ins in tqdm(task_instructions, desc=f"[{i}/8][{int(j) - 1}/3]"):
-                    trial_path = os.path.join(batch_path, j, ins, "success", "trial_1")
+                    trial_path = os.path.join(batch_path, j, ins, "success", "trial_1")  # 取出对应指令导航成功的轨迹来训练
                     assert os.path.isdir(trial_path)
 
-                    entries = os.listdir(trial_path)
+                    entries = os.listdir(trial_path)  # list 不保证有序，所以要进行排序
                     action_dirs = []
                     for name in entries:
                         full = os.path.join(trial_path, name)
@@ -150,7 +174,7 @@ def generate_swift_dataset(args):
 
                     assert len(action_dirs) > 0
 
-                    action_dirs.sort(key=lambda x: x[0])
+                    action_dirs.sort(key=lambda x: x[0])  # 按照 action index 排序
 
                     if data_augmentation:
                         round = window_size
@@ -164,7 +188,7 @@ def generate_swift_dataset(args):
                         act_num = 0
                         stop_count = 0
 
-                        for act_idx, act_str in action_dirs:
+                        for act_idx, act_str in action_dirs:  # 沿着一个完整的 trajactory 扫描，每积累够 window_size 个动作，就生成一个训练样本
                             act_path = os.path.join(trial_path, act_str)
 
                             # import pdb; pdb.set_trace()
@@ -184,7 +208,7 @@ def generate_swift_dataset(args):
                                 assert stop_count <= 3
                                 assert act_num == len(future_images)
 
-                                if len(images) > max_his_image_num + 3:
+                                if len(images) > max_his_image_num + 3:  # 历史 front 图像 + 当前 front、left、right 图像
                                     images = images[-(max_his_image_num + 3):]
 
                                 history_count = max(0, len(images) - 3)
@@ -223,16 +247,18 @@ def generate_swift_dataset(args):
                                     if vln_action_complexity(gt_acts, window_size=window_size) > 0.7 or '<|stop|>' in gt_acts:
                                         outfile.write(json.dumps(data, ensure_ascii=False) + "\n")
 
+                                # 推进采集的图片，比如从k=0开始，搜集到的图片是：images = [L-1, F-1, R-1]、future_images = [F0, F1, F2, F3, F4]
                                 front_image = images[-2]
                                 images = images[:-3]
-                                images.append(front_image)
+                                images.append(front_image)  # s-1 的 F-1 变成历史图
 
-                                images.extend(future_images[:-1])
+                                images.extend(future_images[:-1])  # [F-1, F0, F1, F2, F3]
 
                                 if act == "<|stop|>":
                                     stop_count += 1
                                     images = []
 
+                                # F4 为当前观测
                                 images.append(os.path.join(act_path, "left.png"))
                                 images.append(os.path.join(act_path, "front.png"))
                                 images.append(os.path.join(act_path, "right.png"))
@@ -247,7 +273,7 @@ if __name__ == "__main__":
     parser.add_argument("--set_name", type=str, default="val", choices=["train", "test", "val"], help="Dataset split to use.")
     # TODO: change default value
     parser.add_argument("--base_dir", type=str, default="data/images", help="Base directory for LH-VLN data.")
-    parser.add_argument("--max_his_image_num", type=int, default=20, help="Maximum number of historical images to include.")
+    parser.add_argument("--max_his_image_num", type=int, default=20, help="Maximum number of historical images to include.")  # 最多 20 张历史观测
     parser.add_argument("--window_size", type=int, default=5, help="Number of future actions the model predicts in each sliding window step.")
     parser.add_argument("--data_augmentation", action="store_true", help="Enable data augmentation during training (default: disabled).")
     parser.add_argument("--sample_ratio", type=float, default=1.0, help="Proportion of the original dataset to sample. 1.0 means using the full dataset.")

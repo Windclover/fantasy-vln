@@ -17,7 +17,7 @@ def check_data_alignment(data1, data2):
     return all(data1.get(k) == data2.get(k) for k in keys)
 
 
-def tvcot_to_mmcot_data(v_data, t_data):
+def tvcot_to_mmcot_data(v_data, t_data):  # T-CoT + V-CoT -> MM-CoT
     t_cot = extract_substr(
         t_data['messages'][1]['content'],
         "<think>",
@@ -33,6 +33,8 @@ def tvcot_to_mmcot_data(v_data, t_data):
         "<no_textual_think>",
         "<textual_think>"
     )
+
+    # <think>文字推理...</think><var><|123|><|58|><|91|>...</var><var><|72|><|311|><|9|>...</var><answer><|forward|><|left|>...</answer>
     return mm_data
 
 def tcot_to_noncot_data(t_data):

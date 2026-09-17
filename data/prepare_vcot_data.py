@@ -7,10 +7,14 @@ from concurrent.futures import ProcessPoolExecutor
 
 from data_utils import extract_substr
 
+"""
+把每条 Non-CoT 数据里的 future_images，替换成这些未来图像对应的 VAR latent token，然后塞进 <var>...</var>，生成 V-CoT 数据。
+"""
+
 MAX_WORKERS = min(32, (os.cpu_count() or 8))
 SUBSET_NAME = True
 
-def ipath_to_varpath(img_path: str) -> str:
+def ipath_to_varpath(img_path: str) -> str:  # 把未来 RGB 图像路径，转换成对应的 VAR token 文件路径。
     return img_path.replace("/task/", "/var_tokens/").replace(".png", ".pt")
 
 
@@ -24,9 +28,9 @@ def process_one_line(line: str, scale_schedule: list) -> str:
 
     for img_path in future_imgs:
         var_path = ipath_to_varpath(img_path)
-        scale = scale_schedule[0]
-        arr = torch.load(var_path, map_location='cpu')[scale].tolist()
-        var_token = [f"<|{token_id}|>" for token_id in arr]
+        scale = scale_schedule[0]  # VAR 是多个 scale, 这里只取出第一个 scale
+        arr = torch.load(var_path, map_location='cpu')[scale].tolist()  # 取出第一个 scale 对应的 VAR token id
+        var_token = [f"<|{token_id}|>" for token_id in arr]  # <|12|><|85|><|190|><|7|>
         var_token = "".join(var_token)
         future_var_tokens.append(var_token)
 

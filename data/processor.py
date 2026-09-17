@@ -15,6 +15,10 @@ from swift.llm.dataset.loader import DatasetLoader, init_self_cognition_preproce
 from swift.llm import MessagesPreprocessor, DatasetMeta, register_dataset
 
 
+"""
+把刚才生成好的 UMMCoT JSONL 注册给 ms-swift，并把每一行里的 4 个 branch 分别预处理成模型训练能直接使用的数据格式。
+"""
+
 DATASET_TYPE = Union[HfDataset, HfIterableDataset]
 
 
@@ -22,6 +26,10 @@ logger = get_logger()
 
 
 class UMMCoTDatasetLoader(DatasetLoader):
+    """
+    普通 Swift 数据通常是：{"messages": ..., "images": ...}
+    UMMCoT 一条数据是：{"Non_CoT": {...}, "T_CoT": {...}, "V_CoT": {...}, "MM_CoT": {...}}
+    """
     @staticmethod
     def _load_dataset_path(
         dataset_path: str,
@@ -44,6 +52,7 @@ class UMMCoTDatasetLoader(DatasetLoader):
             dataset = hf_load_dataset(file_type, data_files=dataset_path, **kwargs)
         if columns:
             dataset = UMMCOTPreprocessor.safe_rename_columns(dataset, columns)
+        # 调用自定义 preprocessor
         dataset = dataset_meta.preprocess_func(
             dataset, num_proc=num_proc, load_from_cache_file=load_from_cache_file, strict=strict)
         if remove_unused_columns:
@@ -65,6 +74,7 @@ class UMMCoTDatasetLoader(DatasetLoader):
         columns: Optional[Dict[str, str]] = None,
         remove_unused_columns: bool = True,
     ) -> HfDataset:
+        "判断文件来自本地文件还是网络"
         if dataset_syntax.dataset_type == 'path':
             dataset = UMMCoTDatasetLoader._load_dataset_path(
                 dataset_syntax.dataset,
@@ -104,6 +114,8 @@ class UMMCOTPreprocessor(MessagesPreprocessor):
     def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
         processed_row = {}
         for branch_name, branch_input in row.items():
+            # 普通 Swift 的 MessagesPreprocessor 本来就是处理多模态数据
+            # 所以对四个训练数据的 branch 分别调用一次原来的 MessagesPreprocessor。
             processed_row[branch_name] = super().preprocess(branch_input)
         return processed_row
     
@@ -114,6 +126,37 @@ class UMMCOTPreprocessor(MessagesPreprocessor):
     
     def batched_preprocess(self, batched_row: Dict[str, Any], *, strict: bool,
                            ignore_max_length_error: bool) -> Dict[str, Any]:
+        """
+        原来的 UMMCoT 一条数据：
+        sample
+            ├── Non_CoT
+            │   ├── messages
+            │   ├── images
+            │   ├── future_images
+            │   ├── batch_id
+            │   └── ...
+            │
+            ├── T_CoT
+            ├── V_CoT
+            └── MM_CoT
+        处理后：
+        sample
+            ├── Non_CoT
+            │   ├── messages
+            │   └── images
+            │
+            ├── T_CoT
+            │   ├── messages
+            │   └── images
+            │
+            ├── V_CoT
+            │   ├── messages
+            │   └── images
+            │
+            └── MM_CoT
+                ├── messages
+                └── images
+        """
         from swift.llm.template import MaxLengthError
         batched_row = dict(batched_row)
         assert len(batched_row) > 0
@@ -126,7 +169,7 @@ class UMMCOTPreprocessor(MessagesPreprocessor):
                 row = self.preprocess(row)
                 for branch_name, branch_input in row.items():
                     for key in list(branch_input.keys()):
-                        if key not in ['messages', 'images']:
+                        if key not in ['messages', 'images']:  # 只需要 messages images 数据，VCoT 的数据已经放在 messages <var></var> 中了。
                             del branch_input[key]
                 # support [row1, row2, ...]
                 if row is None:

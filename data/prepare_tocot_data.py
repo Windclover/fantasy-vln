@@ -7,6 +7,9 @@ from typing import List, Optional
 
 from data_utils import extract_substr, is_valid_think_block
 
+"""
+读取刚才生成的 Non-CoT JSONL，再把 Excel 里的 textual CoT 标注塞进 <think>...</think>，从而生成 T-CoT 数据。
+"""
 
 def count_lines(path: str) -> int:
     with open(path, "r", encoding="utf-8") as f:
@@ -50,7 +53,7 @@ def prepare_tcot_dataset(
             "Your original logic assumes 1-to-1 row alignment by index."
         )
 
-    invalid_lines: List[int] = []
+    invalid_lines: List[int] = []  # 记录格式有问题的 JSONL 行号
     kept = 0
     skipped_not_success = 0
 
@@ -77,25 +80,41 @@ def prepare_tcot_dataset(
 
             # replace tag in user message
             try:
-                data["messages"][0]["content"] = data["messages"][0]["content"].replace(replace_from, replace_to)
+                data["messages"][0]["content"] = data["messages"][0]["content"].replace(replace_from, replace_to)  # 更改的 "usr_prompt"
             except Exception:
                 invalid_lines.append(i)
                 continue
 
             # original gt
             try:
-                gt = data["messages"][1]["content"]
+                gt = data["messages"][1]["content"]  # gt = vln_answer
             except Exception:
                 invalid_lines.append(i)
                 continue
 
             tcot = anno_res[answer_col].iloc[i]
 
-            if not is_valid_think_block(tcot):
+            if not is_valid_think_block(tcot):  # 检查 text CoT 回答
                 invalid_lines.append(i)
                 continue
 
             new_gt = f"{tcot}<var></var><answer>{extract_substr(gt)}</answer>"
+            """
+            <think></think>
+            <var></var>
+            <answer>ACTIONS</answer>
+            变成：
+            <think>
+            TEXTUAL COT
+            </think>
+
+            <var>
+            </var>
+
+            <answer>
+            ACTIONS
+            </answer>
+            """
             data["messages"][1]["content"] = new_gt
 
             outfile.write(json.dumps(data, ensure_ascii=False) + "\n")

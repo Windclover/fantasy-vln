@@ -55,7 +55,7 @@ def validate_one_epoch(
         logger.info(config)
         # test for LH-task
         agent = HabitatAgent(args, config, nav_model, subset_name)
-        result = agent.validate()
+        result = agent.validate()  # 真正跑 episode
         metrics[str(len(result['successes']))].add_sample(
             all(result['successes']),
             sum(result['gt_step']),
@@ -172,6 +172,7 @@ def main():
         'step': NavigationMetrics(),
     }
 
+    # 真正开始评估
     validate_one_epoch(args, 0, test_metrics, test_dataloader, nav_model, logger, subset_name)
     logger.info("###### Test ######")
     for key, metrics in test_metrics.items():

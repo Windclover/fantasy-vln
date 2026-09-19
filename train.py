@@ -2,7 +2,7 @@ import argparse
 from typing import List, Optional, Union
 
 from swift.ray import RayHelper
-from swift.llm.train.sft import SwiftSft
+from swift.llm.train.sft import SwiftSft  # ms-swift 原本标准的 SFT 训练流程
 from swift.llm.argument import TrainArguments
 from swift.trainers import TrainerFactory
 from swift.utils import get_logger, get_model_parameter_info
@@ -10,14 +10,53 @@ from swift.utils import get_logger, get_model_parameter_info
 from data.processor import load_dataset, UMMCoTDatasetLoader
 from my_qwen_template import MyQwen2_5VLTemplate
 
+"""
+    UMMCoT JSONL
+    │
+    ▼
+    processor.py
+    │
+    │  一条数据 = Non / T / V / MM
+    ▼
+    MyQwen2_5VLTemplate
+    │
+    │  四个 branch 分别 encode
+    │  四个 branch 分别 collate
+    ▼
+    batch = {
+        Non_CoT: ...,
+        T_CoT: ...,
+        V_CoT: ...,
+        MM_CoT: ...
+    }
+    │
+    ▼
+    train.py
+    │
+    │ use_ummcot=True
+    ▼
+    task_type="ummcot"
+    │
+    ▼
+    MyTrainerFactory
+    │
+    ▼
+    trainer.MySeq2SeqTrainer
+        │
+        ├── 普通 SFT loss ?
+        ├── 四个 branch 怎么 forward ?
+        ├── cross-mode alignment ?
+        ├── temperature 怎么用 ?
+        └── alignment_weight 怎么加 ?
+"""
 
 logger = get_logger()
 
 
 class MyTrainerFactory(TrainerFactory):
     TRAINER_MAPPING = {
-        **TrainerFactory.TRAINER_MAPPING,
-        'ummcot': 'trainer.MySeq2SeqTrainer',
+        **TrainerFactory.TRAINER_MAPPING,  # 把原来的全部复制过来
+        'ummcot': 'trainer.MySeq2SeqTrainer',  # 新增 ummcot
     }
 
     TRAINING_ARGS_MAPPING = {
@@ -26,12 +65,13 @@ class MyTrainerFactory(TrainerFactory):
     }
 
 
-class MySwiftSft(SwiftSft):
+class MySwiftSft(SwiftSft):  # 核心 wrapper
     def __init__(self, args: Optional[Union[List[str], TrainArguments]] = None) -> None:
         super().__init__(args)
 
     def _get_trainer_kwargs(self):
         kwargs = super()._get_trainer_kwargs()
+        # FantasyVLN 再额外增加 4 个参数
         kwargs['use_ummcot'] = bool(getattr(self.args, 'use_ummcot', False))
         kwargs['cross_mode_alignment'] = bool(getattr(self.args, 'cross_mode_alignment', False))
         kwargs['alignment_temperature'] = float(getattr(self.args, 'alignment_temperature', 1.0))
@@ -41,16 +81,17 @@ class MySwiftSft(SwiftSft):
     
     def _get_dataset(self):
         # The random shuffling of the training set occurs in the dataloader of the trainer.
+        # 从 Swift 的 TrainArguments 中取 dataset 相关配置。
         args = self.args
         dataset_kwargs = args.get_dataset_kwargs()
         train_dataset, val_dataset = None, None
-        if args.dataset:
+        if args.dataset:  # 这里的 load_dataset 不是 HuggingFace 原版，而是修改过的
             train_dataset, val_dataset = load_dataset(
                 args.dataset,
                 split_dataset_ratio=args.split_dataset_ratio,
                 shuffle=args.dataset_shuffle,
                 **dataset_kwargs)
-        if len(args.val_dataset) > 0:
+        if len(args.val_dataset) > 0:  # 如果已经单独提供了 validation dataset，就不允许再从 train dataset 里面切 validation
             # Loading val dataset
             _, val_dataset = load_dataset(
                 args.val_dataset, split_dataset_ratio=1.0, shuffle=args.val_dataset_shuffle, **dataset_kwargs)
@@ -75,6 +116,8 @@ class MySwiftSft(SwiftSft):
                 train_datasets, val_datasets = get_cached_dataset(self.args)
         else:
             train_datasets, val_datasets = [], []
+
+        # 真正获得训练的 dataset
         if args.dataset or args.val_dataset:
             train_dataset, val_dataset = self._get_dataset()
             train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset, pre_process=pre_process)
@@ -104,18 +147,19 @@ class MySwiftSft(SwiftSft):
             logger.info(f'args.problem_type: {args.problem_type}')
         args.save_args()
 
-        data_collator = self._get_data_collator()
+        data_collator = self._get_data_collator()  # sample-first -> branch-first
         # Some tuners require train_dataset and data_collator for preparation: LoRA-GA
         self.model = self.prepare_model(self.args, self.model, template=self.template, train_dataset=train_dataset)
         logger.info(f'model: {self.model}')
         model_parameter_info = get_model_parameter_info(self.model)
         self.train_msg['model_parameter_info'] = model_parameter_info
         logger.info(f'model_parameter_info: {model_parameter_info}')
-        
+
+        # 训练切换开关
         if args.use_ummcot:
             args.task_type = 'ummcot'
 
-        trainer_cls = MyTrainerFactory.get_trainer_cls(args)
+        trainer_cls = MyTrainerFactory.get_trainer_cls(args)  # if ummcot then trainer_cls = trainer.MySeq2SeqTrainer
         trainer = trainer_cls(
             model=self.model,
             args=self.args.training_args,

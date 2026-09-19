@@ -77,14 +77,18 @@ class HabitatAgent:
         # 获取当前环境信息
         action = 'stop'
         obs, done, info = self.task_sim.actor(action)
-        
+
+        # 建立 Habitat Simulator
         self.task_sim.gt_step = self.task_sim.count_gt_step(step_task)
+
+        # 重新设置初始状态
         if step_task:
             pos = self.config["start_pos"]
             yaw = math.degrees(self.config["start_yaw"] - 180)
             rot = transback_rotation(euler_angles_to_rotation_matrix(np.array([0, 0, yaw])))
             self.task_sim.set_state(pos, rot)
-        
+
+        # 清空历史状态
         if isinstance(self.nav_model, My_VLM_NavModel):
             self.nav_model.his_images = []
             action_list = []  # multi step prediction model
@@ -115,6 +119,8 @@ class HabitatAgent:
                 previous_stage = self.task_sim.stage
 
             obs_path = []
+
+            # 获取当前观测图像
             for img in obs:
                 out_path = os.path.join(cache_dir, f"{img_idx}.png")
                 img.save(out_path)
@@ -124,6 +130,13 @@ class HabitatAgent:
             if isinstance(self.nav_model, My_VLM_NavModel):
                 view_inputs = obs_path  # VLM 直接传图像路径
 
+            """
+            agent.py
+                ↓
+            input["observations"]
+                ↓
+            VLMModel.step(batch_inputs)
+            """
             input = {
                 'observations': [
                     {
@@ -138,7 +151,7 @@ class HabitatAgent:
             print(f"Debug: {self.task_sim.ins}")
 
             label = self.task_sim.get_next_action(info["target coord"])
-            if action_list is None:    
+            if action_list is None:  # 如果没有动作可以执行，则调用 model 推理
                 action, output = self.nav_model.step(input["observations"])
             else:
                 assert isinstance(action_list, list)
@@ -148,7 +161,7 @@ class HabitatAgent:
                 if len(action_list) == 0:  # BUG: Model failed to generate action and then stop task
                     print("Model failed to generate action and then stop task")
                     action = 'stop'
-                else:
+                else:  # 这里说明这里是预测几步然后模型就会执行几步，相当于推理->移动->观测->移动->观测->...->推理
                     action = action_list.pop(0)
             
             # import pdb; pdb.set_trace()
@@ -159,17 +172,22 @@ class HabitatAgent:
             # Record historical frames
             if self.task_sim.stage not in navigation_videos:
                 navigation_videos[self.task_sim.stage] = []
+
+            # obs_path[1] = front，所以记录历史图像只记录前视图
+            # navigation_videos 是为了记录整条导航轨迹，最后保存成功 episode 的图片。
             navigation_videos[self.task_sim.stage].append(obs_path[1])
             # Record historical actions
             if self.task_sim.stage not in his_actions:
                 his_actions[self.task_sim.stage] = []
             his_actions[self.task_sim.stage].append(action)
 
+            # 让 Habitat 执行动作，更新当前观测图像
             obs, done, info = self.task_sim.actor(action)
 
             # Update historical visual observations
+            # self.nav_model.his_images 是推理时候保存的历史图像
             self.nav_model.his_images.append(obs_path[1])
-            if len(self.nav_model.his_images) > 20:
+            if len(self.nav_model.his_images) > 20:  # 只保存最近 20 张历史图像
                 self.nav_model.his_images = self.nav_model.his_images[-20:]
             print(len(self.nav_model.his_images))
 

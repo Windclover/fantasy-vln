@@ -22,7 +22,7 @@ torchrun \
     --dataset my_training_data \
     --use_ummcot \
     --cross_mode_alignment \
-    --new_special_tokens 'special_tokens/action_and_var_tokens.txt' \
+    --new_special_tokens 'special_tokens/action_and_var_tokens.txt' \  # 添加的 special toekns
     --torch_dtype bfloat16 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
@@ -44,5 +44,5 @@ torchrun \
     --dataloader_num_workers 7 \
     --deepspeed zero2 \
     --add_version \
-    --modules_to_save embed_tokens lm_head \
+    --modules_to_save embed_tokens lm_head \  # embed_tokens 和 lm_head 不能只靠 LoRA/freeze，得把它们保存并训练。
     --template my_qwen2_5_vl \

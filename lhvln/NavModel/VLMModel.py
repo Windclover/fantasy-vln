@@ -18,7 +18,7 @@ def extract_substr(input_str, start_token="<answer>", end_token="</answer>"):
     pattern = f"{start_token}(.*?){end_token}"
     substr = re.findall(pattern, input_str, re.DOTALL)
     # print(f"Debug: {input_str}")
-    return substr
+    return substr  # ["<|left|><|forward|>"]
 
 
 class My_VLM_NavModel:
@@ -29,23 +29,27 @@ class My_VLM_NavModel:
             device_map=None,
         ).to(device)
 
-        input_emb = model.get_input_embeddings()
-        embed_weights = input_emb.weight
+        input_emb = model.get_input_embeddings()  # 获取模型的输入 token embedding 层
+        embed_weights = input_emb.weight  # 取出输入 embedding 的权重
 
+        # lm_head 是语言模型输出头
         new_lm_head_weight = torch.zeros_like(embed_weights)
-        model.lm_head.weight = nn.Parameter(new_lm_head_weight)
+        model.lm_head.weight = nn.Parameter(new_lm_head_weight)  # 把模型的 lm_head 权重替换成这个全零张量，并包装成 nn.Parameter，使其成为可训练参数
 
-        idx_file = 'model.safetensors.index.json'
+        """
+        从 HuggingFace safetensors 分片文件中，单独提取 lm_head 的权重，重命名后加载到模型的 lm_head 子模块中
+        """
+        idx_file = 'model.safetensors.index.json'  # model.safetensors.index.json 告诉程序某个参数在哪个 shard
         idx_path = os.path.join(model_id, idx_file)
         idx_data = json.load(open(idx_path))
-        lm_head_mapping = idx_data['weight_map']['lm_head.weight']
+        lm_head_mapping = idx_data['weight_map']['lm_head.weight']  # 取出一个字符串，表示 lm_head.weight 这个参数存储在哪个 safetensors 分片文件里
         lm_head_ckpt = os.path.join(model_id, lm_head_mapping)
-        state_dict = load_file(lm_head_ckpt)
+        state_dict = load_file(lm_head_ckpt)  # 加载权重文件
         for key in list(state_dict.keys()):
             if 'lm_head' in key:
-                new_key = key[len('lm_head.'):]
-                state_dict[new_key] = state_dict.pop(key)
-        missing_keys, unexpected_keys = model.lm_head.load_state_dict(state_dict, strict=False)
+                new_key = key[len('lm_head.'):]  # 把键名去掉前缀 'lm_head.'，得到子模块内部的参数名。
+                state_dict[new_key] = state_dict.pop(key)  # 从字典中取出原键的值，并删除原键
+        missing_keys, unexpected_keys = model.lm_head.load_state_dict(state_dict, strict=False)  # lm_head 真正加载权重
         assert len(missing_keys) == 0
         del state_dict
 
@@ -65,6 +69,7 @@ class My_VLM_NavModel:
 
     def _get_prompt(self, task_ins, his_img_num, stop_count, model_name="FantasyVLN"):
         if model_name == "FantasyVLN":
+            # 在线推理时明确使用 Non-CoT mode
             prefix = (
                 "<no_textual_think><no_visual_think>"
                 "You are an autonomous navigation robot. You will get a task with historical pictures and current pictures you see.\n"
@@ -127,7 +132,7 @@ class My_VLM_NavModel:
                 else:
                     action = action[0]
             else:
-                action = action[0]
+                action = action[0]  # 变成字符串
             
             try:
                 assert isinstance(action, str)
@@ -164,8 +169,12 @@ class My_VLM_NavModel:
 
     @torch.no_grad()
     def step(self, batch_inputs):
+        """
+        在线导航每一个决策时刻被调用一次
+        """
         # import pdb; pdb.set_trace()
         # prepare inputs
+        # batchsize = 1 的在线导航
         task_ins = batch_inputs[0]['instruction']
         obs_imgs = batch_inputs[0]['view_feats']
 
@@ -192,6 +201,20 @@ class My_VLM_NavModel:
         )
         image_inputs, video_inputs = process_vision_info(nav_inputs)
 
+        """
+        因为前面的 prompt 里面，格式是：
+        # Your historical pictures are: <image><image>
+        # Your current observations are
+        left: <image>,
+        front: <image>,
+        right: <image>
+        真正的 image 放在 prompt 的最后：{"type": "image", "image": img}
+
+        这里的 <image> 都是自己定义的占位符，apply_chat_template 不会识别到，只会把 prompt 最后的 image 处理成 <|vision_start|><|image_pad|><|vision_end|>。
+        所以为了位置的正确，自己做两个替换：
+        1. 先把最后的 <|vision_start|><|image_pad|><|vision_end|> 占位符删除；
+        2. 把前面的 text 里面自定义的 <image> 占位符替换为可以被后续 processor 处理的 <|vision_start|><|image_pad|><|vision_end|>
+        """
         new_template_text = text.replace("<|vision_start|><|image_pad|><|vision_end|>", "")
         new_template_text = new_template_text.replace("<image>", "<|vision_start|><|image_pad|><|vision_end|>")
         text = new_template_text

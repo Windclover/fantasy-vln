@@ -77,10 +77,11 @@ logger = get_logger()
 
 
 class MySeq2SeqTrainer(Seq2SeqTrainer):
+    # 先定义 4 种 branch，然后 Non_CoT 承担 action teacher 的特殊角色
     COT_BRANCHES = ('T_CoT', 'V_CoT', 'MM_CoT')
     ACTION_TOKENS = ('<|stop|>', '<|forward|>', '<|left|>', '<|right|>')
 
-    def __init__(
+    def __init__(  # 接受 train.py 传进来的参数
         self,
         *args,
         use_ummcot: bool = False,
@@ -103,6 +104,9 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
             self._validate_alignment_dataset()
 
     def _resolve_action_token_ids(self):
+        """
+        <|forward|> 必须变成一个 tokenize 成比如 [151667] 而不能变成多个 token id
+        """
         tokenizer = self.template.tokenizer
         action_token_ids = []
         for token in self.ACTION_TOKENS:
@@ -113,6 +117,9 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
         return tuple(action_token_ids)
 
     def _validate_alignment_dataset(self):
+        """
+        判断数据是否合法，当启动 cross_mode_alignment 模式时，至少需要 'Non_CoT' 数据 + 'T_CoT', 'V_CoT', 'MM_CoT' 其中一个数据
+        """
         if not self.use_ummcot:
             raise ValueError('cross_mode_alignment requires --use_ummcot.')
         columns = set(getattr(self.train_dataset, 'column_names', []) or [])
@@ -129,6 +136,7 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
 
     @staticmethod
     def _action_mask(labels: torch.Tensor, action_token_ids) -> torch.Tensor:
+        # 生成一个布尔掩码，标记出 labels 中所有属于指定动作 token 集合的位置
         mask = torch.zeros_like(labels, dtype=torch.bool)
         for token_id in action_token_ids:
             mask |= labels.eq(token_id)
@@ -146,21 +154,27 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
         branch_name: str,
     ):
         """Mix hard CoT-token targets with ordinally aligned soft action targets."""
-        shift_logits = student_logits[..., :-1, :].contiguous()
-        shift_labels = student_labels[..., 1:].contiguous()
-        valid_mask = shift_labels.ne(-100)
-        action_mask = cls._action_mask(shift_labels, action_token_ids) & valid_mask
-        hard_mask = valid_mask & ~action_mask
+        """
+        student = T-CoT、V-CoT、MM-CoT teacher = Non-CoT，是一个单向 teacher -> student 的 alignment
+        """
+        # sequence 位置 i 的 logit 会预测位置 i+1 的 token，所以 shift_logits 和 shift_labels 错位 1。
+        shift_logits = student_logits[..., :-1, :].contiguous()  # [B, seq_len-1, vocab_size]
+        shift_labels = student_labels[..., 1:].contiguous()  # [B, seq_len-1, vocab_size]
+        valid_mask = shift_labels.ne(-100)  # -100 的 label 不参与 loss 计算
+        # 两种 supervised token
+        action_mask = cls._action_mask(shift_labels, action_token_ids) & valid_mask  # action token [B, seq_len - 1]
+        hard_mask = valid_mask & ~action_mask  # 有效 label 中的非动作 token，就是 CoT token [B, seq_len - 1]
 
-        if hard_mask.any():
+        if hard_mask.any():  # 非 action token loss 用普通 Hard CE
             hard_loss = F.cross_entropy(shift_logits[hard_mask].float(), shift_labels[hard_mask])
         else:
             hard_loss = shift_logits.sum() * 0.0
 
+        # action loss 用 Non-CoT 的 soft distribution
         soft_losses = []
-        for sample_idx in range(shift_labels.shape[0]):
-            student_actions = shift_logits[sample_idx][action_mask[sample_idx]]
-            teacher_actions = teacher_action_logits[sample_idx].to(student_actions.device)
+        for sample_idx in range(shift_labels.shape[0]):  # 逐个 batch sample 做计算
+            student_actions = shift_logits[sample_idx][action_mask[sample_idx]]  # [num_actions, vocab_size]
+            teacher_actions = teacher_action_logits[sample_idx].to(student_actions.device)  # [num_actions, vocab_size]
             if student_actions.shape[0] != teacher_actions.shape[0]:
                 raise ValueError(
                     f'Action count mismatch for {branch_name}, sample {sample_idx}: '
@@ -168,13 +182,15 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
                 )
             if student_actions.shape[0] == 0:
                 continue
+
+            # teacher distribution 对 student distribution 的 soft cross entropy。
             teacher_probs = F.softmax(teacher_actions.float() / temperature, dim=-1)
             student_log_probs = F.log_softmax(student_actions.float() / temperature, dim=-1)
-            soft_losses.append(-(teacher_probs * student_log_probs).sum(dim=-1))
+            soft_losses.append(-(teacher_probs * student_log_probs).sum(dim=-1)) 
 
         if not soft_losses:
             raise ValueError(f'No action tokens found while computing alignment loss for {branch_name}.')
-        soft_loss = torch.cat(soft_losses).mean() * (temperature ** 2)
+        soft_loss = torch.cat(soft_losses).mean() * (temperature ** 2)  # 前面的 softmax 温度 T 增大后分布变软，同时梯度尺度会变小。所以通常乘 T^2 补偿梯度量级。
         return hard_loss + alignment_weight * soft_loss, hard_loss.detach(), soft_loss.detach()
 
     def _backward(self, loss: torch.Tensor):
@@ -193,6 +209,7 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
 
     @staticmethod
     def _model_forward_inputs(inputs):
+        # 去除不属于模型 forward 的标准参数
         inputs = dict(inputs)
         for key in ('compute_loss_func', 'loss_scale', 'text_position_ids', 'channel'):
             inputs.pop(key, None)
@@ -208,6 +225,7 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
             shift_logits = outputs.logits[..., :-1, :]
             shift_labels = labels[..., 1:]
             action_mask = self._action_mask(shift_labels, self.action_token_ids) & shift_labels.ne(-100)
+            # 取出 teacher 推理的 action 位置的 logits
             action_logits = [
                 shift_logits[sample_idx][action_mask[sample_idx]].detach()
                 for sample_idx in range(shift_labels.shape[0])
@@ -218,6 +236,7 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
             return action_logits
 
     def _alignment_branch_step(self, model, inputs, teacher_action_logits, branch_name, branch_count):
+        # 对某一个 CoT branch forward，然后计算刚才的 alignment loss，再 backward
         cp_context, inputs = self._prepare_context_parallel_inputs(model, dict(inputs))
         with cp_context():
             inputs = self._prepare_inputs(inputs)
@@ -235,8 +254,8 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
                 )
             if self.args.n_gpu > 1:
                 loss = loss.mean()
-            scaled_loss = loss / (self.current_gradient_accumulation_steps * branch_count)
-            self._backward(scaled_loss)
+            scaled_loss = loss / (self.current_gradient_accumulation_steps * branch_count)  # 除以梯度累积步数和 branch 数量
+            self._backward(scaled_loss)  # 反向传播
             return loss.detach(), hard_loss, soft_loss
 
     def _optimizer_update(self, model):
@@ -269,13 +288,13 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
 
             optimizer_context = implicit_replication
         with optimizer_context():
-            self.optimizer.step()
+            self.optimizer.step()  # 更新参数
         self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
         learning_rate = self._get_learning_rate()
         if not self.accelerator.optimizer_step_was_skipped:
             if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.lr_scheduler.step()
-        model.zero_grad()
+                self.lr_scheduler.step()  # 更新学习率
+        model.zero_grad()  # 梯度清空
         self.state.global_step += 1
         return grad_norm, learning_rate
     
@@ -301,6 +320,16 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
             self.state.train_batch_size = self._train_batch_size
         logger.debug(f"Currently training with a batch size of: {self._train_batch_size}")
         # Data loader and number of training steps
+
+        """
+        正常获取 dataloader，inputs:
+        {
+            "Non_CoT": {...},
+            "T_CoT": {...},
+            "V_CoT": {...},
+            "MM_CoT": {...}
+        }
+        """
         train_dataloader = self.get_train_dataloader()
         if self.is_fsdp_xla_v2_enabled:
             train_dataloader = tpu_spmd_dataloader(train_dataloader)
@@ -519,7 +548,8 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
 
-        for epoch in range(epochs_trained, num_train_epochs):
+        # 真正进入训练 epoch
+        for epoch in range(epochs_trained, num_train_epochs):  # 断点续训
             epoch_dataloader = train_dataloader
             if hasattr(epoch_dataloader, "set_epoch"):
                 epoch_dataloader.set_epoch(epoch)
@@ -556,19 +586,25 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
             total_updates = steps_in_epoch // args.gradient_accumulation_steps + int(
                 remainder < args.gradient_accumulation_steps
             )
+
+            # 处理 Gradient Accumulation
             for _ in range(total_updates):
+                # 取出 batch
                 update_step += 1
                 num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
                 batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_batches, args.device)
                 # Store the number of batches for current gradient accumulation
                 # This is used to correctly scale the loss when the last accumulation step has fewer batches
                 self.current_gradient_accumulation_steps = len(batch_samples)
+
+                # 使用 cross_mode_alignment 训练
                 if self.cross_mode_alignment:
                     if rng_to_sync:
                         self._load_rng_state(resume_from_checkpoint)
                         rng_to_sync = False
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
                     non_cot_losses = []
+                    # inputs 有 4 个 key
                     for i, inputs in enumerate(batch_samples):
                         step += 1
                         self.accelerator.gradient_state._set_sync_gradients(i == len(batch_samples) - 1)
@@ -580,8 +616,10 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
                         )
                         with no_sync_context():
                             non_cot_losses.append(
-                                self.training_step(model, inputs, num_items_in_batch, mode='no_thinking')
+                                self.training_step(model, inputs, num_items_in_batch, mode='no_thinking')  # 只训练 Non-CoT
                             )
+
+                    # 训练完 Non-CoT 后会更新一次参数
                     self.accelerator.gradient_state._set_sync_gradients(True)
                     non_cot_loss = torch.stack(non_cot_losses).mean()
                     tr_loss = tr_loss + non_cot_loss
@@ -589,12 +627,15 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
+                    # 用更新完参数的模型再次 forward，得到 teacher action logits
                     teacher_batches = [
                         self._teacher_action_logits(model, inputs['Non_CoT']) for inputs in batch_samples
                     ]
 
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
                     cot_losses = []
+
+                    # 训练 T-CoT、V-CoT、MM-CoT
                     for i, (inputs, teacher_logits) in enumerate(zip(batch_samples, teacher_batches)):
                         cot_branches = [branch for branch in self.COT_BRANCHES if branch in inputs]
                         if not cot_branches:
@@ -610,6 +651,7 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
                         )
                         with no_sync_context():
                             branch_losses = []
+                            # 对每个 CoT branch 进行 loss 计算
                             for branch_name in cot_branches:
                                 branch_loss, _, _ = self._alignment_branch_step(
                                     model,
@@ -623,6 +665,8 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
                     self.accelerator.gradient_state._set_sync_gradients(True)
                     cot_loss = torch.stack(cot_losses).mean()
                     tr_loss = tr_loss + cot_loss
+
+                    # 更新 CoT 训练的参数
                     grad_norm, learning_rate = self._optimizer_update(model)
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
@@ -638,7 +682,9 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
                     )
                     if self.control.should_epoch_stop or self.control.should_training_stop:
                         break
-                    continue
+                    continue  # 跳过后面不使用 CoT 训练部分
+
+                # 不使用 cross_mode_alignment 训练
                 for i, inputs in enumerate(batch_samples):
                     step += 1
                     do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch
@@ -684,6 +730,7 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
                         else contextlib.nullcontext
                     )
                     with context():
+                        # 这里虽然也用 Non-CoT + CoT 数据训练，但是是 4 种数据一批训完训下一批，没有对齐机制。
                         tr_loss_step = self.training_step(model, inputs, num_items_in_batch, "thinking")
 
                     if (
@@ -791,6 +838,7 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
                     if is_torch_xla_available():
                         xm.mark_step()
                     break
+            
             if step < 0:
                 logger.warning(
                     "There seems not to be a single sample in your epoch_iterator, stopping training at step"
@@ -900,6 +948,8 @@ class MySeq2SeqTrainer(Seq2SeqTrainer):
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
+
+        # 根据 mode 来选出对应训练数据
         if mode == "no_thinking" and self.use_ummcot:
             if 'Non_CoT' not in inputs:
                 raise ValueError('UMMCoT non-CoT training requires a Non_CoT branch.')
